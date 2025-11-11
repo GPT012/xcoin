@@ -1,0 +1,208 @@
+# aladdin-airdrop — experimental Merkle airdrop builder
+
+This single-file project contains the scripts and configuration to: parse a CSV of `address,amount`, build a Merkle tree for a token distribution, and output a JSON containing the merkle root and per-address proofs.
+
+> Usage (from project root):
+> - `nvm use` (this project includes .nvmrc)
+> - `yarn install`
+> - `yarn start --symbol <TOKEN_SYMBOL> --address <TOKEN_ADDRESS> --csv <CSV_FILE>`
+
+---
+
+## Files (all content below — create these files in a folder)
+
+### .nvmrc
+```
+18
+```
+
+### package.json
+```json
+{
+  "name": "aladdin-airdrop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "csv-parse": "^5.4.0",
+    "ethers": "^6.6.0",
+    "merkletreejs": "^0.2.31",
+    "yargs": "^17.7.2",
+    "fs-extra": "^11.1.1"
+  }
+}
+```
+
+### .gitignore
+```
+node_modules/
+proofs/
+*.log
+```
+
+### sample.csv
+```
+address,amount
+0x1111111111111111111111111111111111111111,100
+0x2222222222222222222222222222222222222222,250.5
+0x3333333333333333333333333333333333333333,1000
+```
+
+### src/index.js
+```javascript
+import fs from 'fs-extra';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import yargs from 'yargs/yargs';
+import { hideBin } from 'yargs/helpers';
+import { buildMerkle } from './merkle.js';
+import { parse } from 'csv-parse/sync';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+async function main() {
+  const argv = yargs(hideBin(process.argv))
+    .option('symbol', { type: 'string', demandOption: true, describe: 'Token symbol' })
+    .option('address', { type: 'string', demandOption: true, describe: 'Token contract address' })
+    .option('csv', { type: 'string', demandOption: true, describe: 'CSV file with address,amount' })
+    .help()
+    .argv;
+
+  const csvPath = path.isAbsolute(argv.csv) ? argv.csv : path.join(process.cwd(), argv.csv);
+  if (!fs.existsSync(csvPath)) {
+    console.error('CSV file not found:', csvPath);
+    process.exit(1);
+  }
+
+  const raw = await fs.readFile(csvPath, 'utf8');
+  const records = parse(raw, { columns: true, skip_empty_lines: true, trim: true });
+
+  // Validate and normalize
+  const entries = records.map((r, i) => {
+    const address = String(r.address || r.Address || Object.values(r)[0]).trim();
+    const amount = String(r.amount || r.Amount || Object.values(r)[1]).trim();
+    if (!address || !amount) throw new Error(`Invalid record on CSV row ${i + 2}`);
+    return { address, amount };
+  });
+
+  const symbol = argv.symbol;
+  const tokenAddress = argv.address;
+
+  const outDir = path.join(process.cwd(), 'proofs');
+  await fs.ensureDir(outDir);
+
+  const result = buildMerkle(entries);
+
+  const output = {
+    token: { symbol, address: tokenAddress },
+    merkleRoot: result.root,
+    totalAmount: result.totalAmount,
+    claims: result.claims // { address: { amount, proof, index } }
+  };
+
+  const outFile = path.join(outDir, `${symbol || 'TOKEN'}-merkle.json`);
+  await fs.writeJson(outFile, output, { spaces: 2 });
+
+  console.log('Merkle file written to', outFile);
+  console.log('Merkle root:', result.root);
+  console.log('Total recipients:', Object.keys(result.claims).length);
+}
+
+main().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+### src/merkle.js
+```javascript
+import { ethers } from 'ethers';
+import keccak256 from 'keccak256';
+import { MerkleTree } from 'merkletreejs';
+
+// Build merkle tree for a simple airdrop scheme where each leaf is
+// keccak256(abi.encodePacked(address, uint256(amountInWei)))
+// We use ethers to parse and to ensure canonical formatting.
+
+function normalizeAmount(amountStr) {
+  // Accept decimal strings like "250.5" and convert to wei-like using 18 decimals
+  // Adjust decimals if the token has different decimals — this script assumes 18.
+  const decimals = 18;
+  const bn = ethers.parseUnits(amountStr, decimals); // ethers v6
+  return bn.toString();
+}
+
+function leafHash(address, amountStr) {
+  const amount = normalizeAmount(amountStr);
+  // solidityPacked keccak256
+  const packed = ethers.solidityPackedKeccak256(['address', 'uint256'], [address, amount]);
+  // merkletreejs expects a Buffer; keccak256 returns a Buffer
+  return Buffer.from(packed.slice(2), 'hex');
+}
+
+export function buildMerkle(entries) {
+  // entries: [{address, amount}, ...]
+  // Sort addresses to ensure deterministic tree (optional but recommended)
+  const sorted = entries.slice().map(e => ({ address: ethers.getAddress(e.address), amount: e.amount }));
+  // aggregate amounts by address in case duplicates
+  const map = new Map();
+  for (const e of sorted) {
+    const addr = e.address;
+    const prev = map.get(addr) || ethers.Zero; // BigInt 0
+    const added = prev + ethers.parseUnits(e.amount, 18);
+    map.set(addr, added);
+  }
+
+  const leavesData = [];
+  let index = 0;
+  let total = ethers.Zero;
+  for (const [address, amountBn] of map.entries()) {
+    const amountStr = amountBn.toString();
+    // build leaf
+    // use solidityPackedKeccak256 and then strip 0x
+    const leafHex = ethers.solidityPackedKeccak256(['address', 'uint256'], [address, amountStr]);
+    const leafBuf = Buffer.from(leafHex.slice(2), 'hex');
+    leavesData.push({ address, amount: amountStr, leaf: leafBuf, index });
+    index += 1;
+    total += amountBn;
+  }
+
+  // Sort leaves by hex to make deterministic (optional)
+  leavesData.sort((a, b) => a.leaf.compare(b.leaf));
+
+  const leaves = leavesData.map(ld => ld.leaf);
+  const tree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+  const root = '0x' + tree.getRoot().toString('hex');
+
+  const claims = {};
+  leavesData.forEach((ld, i) => {
+    const proof = tree.getProof(ld.leaf).map(p => '0x' + p.data.toString('hex'));
+    claims[ld.address] = {
+      index: i,
+      amount: ld.amount,
+      proof
+    };
+  });
+
+  return { root, claims, totalAmount: total.toString() };
+}
+```
+
+---
+
+## Notes & caveats
+- This script **assumes token decimals = 18**. If your token uses different decimals, change the `decimals` variable in `normalizeAmount` (or pass it as an option).
+- The leaf construction uses `keccak256(abi.encodePacked(address, uint256))` (via `ethers.solidityPackedKeccak256`) which must match the on-chain verification method exactly. Make sure your on-chain Merkle claim contract uses the identical packing and hashing.
+- The tool writes `proofs/<SYMBOL>-merkle.json`. That file contains `merkleRoot`, `token` meta, `totalAmount` and `claims` mapping.
+- This is experimental code — test thoroughly on testnet before any mainnet usage.
+
+---
+
+If you want, I can:
+- add a small `claim()` Solidity snippet that verifies the proof and transfers tokens, or
+- add a script to submit the merkle root to a simple MerkleDistributor contract, or
+- change the leaf format to include an `id` or `nonce` if you prefer.
+
